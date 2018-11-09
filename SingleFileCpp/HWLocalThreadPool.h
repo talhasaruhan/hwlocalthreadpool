@@ -9,7 +9,6 @@
 #include <iostream>
 #include <cmath>
 #include <future>
-#include <sstream>
 #include <array>
 #include <cassert>
 
@@ -23,19 +22,19 @@
 *
 *
 * Why?
-*   When doing multithreading on cache sensitive tasks, 
-*   we want to keep threads that operate on same or 
+*   When doing multithreading on cache sensitive tasks,
+*   we want to keep threads that operate on same or
 *     contiguous memory region on the same physical core.
 *
-*   For matrix multiplication, 
-*   assume that we have a HyperThreading system with K physical and 2K logical processors. 
+*   For matrix multiplication,
+*   assume that we have a HyperThreading system with K physical and 2K logical processors.
 *   Each task computes a blocks on the A*B matrix, so memory accesses are exclusive
 *   If we instantiate 2K threads and leave it to the OS to handle them,
 *   In the best case scenerio, each hw core will have a half of its cache available for a block.
 *   And we'll need to access IO more often, possibly freezing the pipeline.
 *
 *   So, instead, we split these blocks into two and have two threads on the same core work on them.
-*   Memory fetches for one thread will directly benefit the other thread as well. 
+*   Memory fetches for one thread will directly benefit the other thread as well.
 *   Very much contrary to the previous loosely threaded scenerio.
 *
 *   Note that we don't account for context switches etc.
@@ -56,7 +55,7 @@
 *
 * Structure:
 *   QueryHWCores:
-*     Uses Windows API to detect the number of physical cores 
+*     Uses Windows API to detect the number of physical cores
 *       and mapping between physical and logical processors.
 *
 *   HWLocalThreadPool:
@@ -64,7 +63,7 @@
 *       array of (void function (void)) of length N
 *         where N is the num of threads that will spawn on the same core,
 *         and, the length of the function ptr array. ith thread handles the ith function
-*     
+*
 *     Core Handlers:
 *       We create NumHWCores many CoreHandler objects.
 *       These objects are responsible for managing their cores.
@@ -75,15 +74,15 @@
 *                         The CoreHandler is assigned to the first function.
 *       Once CoreHandler finishes its own task, it waits for other threads,
 *       Then its available for new jobs, waiting to be notified by the pool manager.
-*     
+*
 *     Thread Handlers:
 *       Responsible for handling tasks handed away by the CoreHandler.
-*       When they finish execution, they signal to notify CoreHandler 
+*       When they finish execution, they signal to notify CoreHandler
 *       Then, they wait for a new task to run until they are terminated.
-* 
+*
 * Notes:
-* 
-*   DON'T KEEP THESE TASKS TOO SMALL. 
+*
+*   DON'T KEEP THESE TASKS TOO SMALL.
 *   We don't want our CoreHandler to check its childrens states constantly,
 *   So, when a thread finishes a task, we signal the CoreHandler.
 *   This might become a overhead if the task itself is trivial.
@@ -177,6 +176,7 @@ namespace QueryHWCores {
 
         map = (ULONG_PTR*)malloc(numHWCores * sizeof(ULONG_PTR));
         memcpy(map, lMap, numHWCores * sizeof(ULONG_PTR));
+        free(lMap);
 
         return 0;
     }
@@ -224,7 +224,7 @@ namespace QueryHWCores {
     }
 };
 
-template <int NumOfCoresToUse = -1, int NumThreadsPerCore = 2, int Debug=0>
+template <int NumOfCoresToUse = -1, int NumThreadsPerCore = 2>
 class HWLocalThreadPool
 {
 public:
@@ -238,6 +238,8 @@ public:
         else
             m_numCoreHandlers = NumOfCoresToUse;
 
+        /* malloc m_coreHandlers s.t no default initialization takes place,
+        we construct every object with placement new */
         m_coreHandlers = (CoreHandler*)malloc(m_numCoreHandlers * sizeof(CoreHandler));
         m_coreHandlerThreads = new std::thread[m_numCoreHandlers];
 
@@ -258,7 +260,7 @@ public:
             Close();
     }
 
-    void Add(std::function<void()>* F) {
+    void Add(std::vector<std::function<void()>> const& F) {
         m_queue.Push(F);
         m_queueToCoreNotifier.notify_one();
     }
@@ -278,6 +280,10 @@ public:
                 m_coreHandlerThreads[i].join();
         }
 
+        /* free doesn't call the destructor, so  */
+        for (int i = 0; i < m_numCoreHandlers; ++i) {
+            m_coreHandlers[i].~CoreHandler();
+        }
         free(m_coreHandlers);
         delete[] m_coreHandlerThreads;
     }
@@ -308,13 +314,13 @@ protected:
 
         void Push(T const& element) {
             std::unique_lock<std::mutex> lock(m_mutex);
-            m_queue.push(element);
+            m_queue.push(std::move(element));
         }
 
         bool Pop(T& function) {
             std::unique_lock<std::mutex> lock(m_mutex);
             if (!m_queue.empty()) {
-                function = m_queue.front();
+                function = std::move(m_queue.front());
                 m_queue.pop();
                 return true;
             }
@@ -334,11 +340,8 @@ protected:
     class CoreHandler {
     public:
         CoreHandler(HWLocalThreadPool* const _parent, const unsigned _id, const ULONG_PTR& _processorMask) :
-            m_parent(_parent), m_id(_id), m_processorAffinityMask(_processorMask), 
-            m_terminate(false), m_numChildThreads(NumThreadsPerCore - 1)
+            m_parent(_parent), m_id(_id), m_processorAffinityMask(_processorMask), m_terminate(false), m_numChildThreads(NumThreadsPerCore - 1)
         {
-            m_job = new std::function<void()>[NumThreadsPerCore];
-
             if (m_numChildThreads > 0) {
                 m_childThreads = new std::thread[m_numChildThreads];
                 m_childThreadOnline = new bool[m_numChildThreads];
@@ -368,7 +371,7 @@ protected:
         }
 
         void CloseChildThreads() {
-            if (m_numChildThreads < 1)
+            if (m_terminate || m_numChildThreads < 1)
                 return;
 
             {
@@ -383,38 +386,33 @@ protected:
                     m_childThreads[i].join();
                 }
             }
+
+            delete[] m_childThreads;
+            delete[] m_childThreadOnline;
         }
 
         void operator()() {
             SetThreadAffinityMask(GetCurrentThread(), m_processorAffinityMask);
             bool dequeued;
-            std::stringstream debugLine;
-            while (!m_parent->m_terminate 
-                || (m_parent->m_waitToFinish && m_parent->m_queue.Size() > 0)) 
-            {
+            while (1) {
                 {
                     std::unique_lock<std::mutex> lock(m_parent->m_queueMutex);
+                    if (m_parent->m_terminate
+                        && !(m_parent->m_waitToFinish && m_parent->m_queue.Size() > 0))
+                    {
+                        break;
+                    }
                     if (m_parent->m_queue.Size() == 0) {
                         m_parent->m_queueToCoreNotifier.wait(lock);
-                    }
-                    if constexpr (Debug) {
-                        debugLine.clear();
-                        debugLine << "Core " << m_id << ", is fetching a job\n";
-                        std::cout << debugLine.str();
+                        //std::cout << "Core " << m_id << ", is fetching a job\n";
                     }
                     dequeued = m_parent->m_queue.Pop(m_job);
                 }
                 if (dequeued) {
+                    m_ownJob = std::move(m_job[0]);
                     if (m_numChildThreads < 1) {
-                        
-                        if constexpr (Debug) {
-                            debugLine.clear();
-                            debugLine << "Core " << m_id 
-                                << ", started executing the job. No child threads as N=1.\n";
-                            std::cout << debugLine.str();
-                        }
-                        
-                        m_job[0]();
+                        //std::cout << "Core " << m_id << ", started executing\n";
+                        m_ownJob();
                     }
                     else {
                         {
@@ -425,58 +423,36 @@ protected:
                             m_coreToThreadNotifier.notify_all();
                         }
 
-                        if constexpr (Debug) {
-                            debugLine.clear();
-                            debugLine << "Run on the CoreHandler:\n";
-                            std::cout << debugLine.str();
-                        }
-
-                        m_job[0]();
+                        //std::cout << "Run on the CoreHandler\n";
+                        m_ownJob();
 
                         WaitForChildThreads();
                     }
                 }
             }
-
-            if constexpr (Debug) {
-                debugLine.clear();
-                debugLine << "Will close the core " << m_id << ", closing threads (if N>0).\n";
-                std::cout << debugLine.str();
-            }
-
+            //std::cout << "Will close the core " << m_id << ", closing threads\n";
             CloseChildThreads();
-
-            if constexpr (Debug) {
-                debugLine.clear();
-                debugLine << "Child threads are terminated (if N>0).\n";
-                std::cout << debugLine.str();
-            }
+            //std::cout << "Child threads are terminated\n";
         }
 
         class ThreadHandler {
         public:
             ThreadHandler(CoreHandler* _parent, const unsigned _id, const ULONG_PTR& _processorAffinityMask) :
-                m_parent(_parent), m_processorAffinityMask(_processorAffinityMask), 
-                m_id(_id), m_jobSlot(_id + 1) {}
+                m_parent(_parent), m_processorAffinityMask(_processorAffinityMask), m_id(_id), m_jobSlot(_id + 1) {}
 
             void operator()() {
                 SetThreadAffinityMask(GetCurrentThread(), m_processorAffinityMask);
-                std::stringstream debugLine;
-                while (!m_parent->m_terminate) {
+                while (1) {
                     {
-                        if constexpr (Debug) {
-                            debugLine.clear();
-                            debugLine << "Thread " << m_id << " of core " 
-                                << m_parent->m_id << " is waiting for a job.\n";
-                            std::cout << debugLine.str();
-                        }
-
+                        //std::cout << "Thread checking for jobs!!\n";
                         std::unique_lock<std::mutex> lock(m_parent->m_threadMutex);
+                        if (m_parent->m_terminate)
+                            break;
                         if (!m_parent->m_childThreadOnline[m_id]) {
                             m_parent->m_coreToThreadNotifier.wait(lock);
                         }
                     }
-                    func = m_parent->m_job[m_jobSlot];
+                    func = std::move(m_parent->m_job[m_jobSlot]);
                     bool online = 0;
                     {
                         online = m_parent->m_childThreadOnline[m_id];
@@ -488,11 +464,7 @@ protected:
                         m_parent->m_threadToCoreNotifier.notify_one();
                     }
                 }
-                if constexpr (Debug) {
-                    debugLine.clear();
-                    debugLine << "Thread " << m_id << " is exiting.\n";
-                    std::cout << debugLine.str();
-                }
+                //std::cout << "Exiting the thread!\n";
             }
 
             const unsigned m_id;
@@ -512,8 +484,10 @@ protected:
         bool* m_childThreadOnline;
         bool m_terminate;
 
-        std::function<void()>* m_job;
+        std::vector<std::function<void()>> m_job;
+        std::function<void()> m_ownJob;
 
+        //std::mutex m_coreMutex;
         std::mutex m_threadMutex;
         std::condition_variable m_coreToThreadNotifier;
         std::condition_variable m_threadToCoreNotifier;
@@ -523,7 +497,7 @@ protected:
     CoreHandler* m_coreHandlers;
     std::thread* m_coreHandlerThreads;
 
-    Queue<std::function<void()>*> m_queue;
+    Queue<std::vector<std::function<void()>>> m_queue;
 
 
     bool m_terminate, m_waitToFinish;
